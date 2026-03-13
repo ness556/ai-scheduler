@@ -241,14 +241,13 @@ function initGoogleAuth() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: GOOGLE_CLIENT_ID,
     scope: GOOGLE_SCOPES,
+    // callbackは用途ごとに設定する（サイレント認証 or 手動ログイン）
     callback: (resp) => {
       if (resp.error) {
-        // サイレント認証失敗 → ログイン画面を表示
         document.getElementById("login-screen").style.display = "flex";
         return;
       }
       accessToken = resp.access_token;
-      // expires_inは秒。2分早めに期限切れとして扱う
       tokenExpiresAt = Date.now() + (resp.expires_in - 120) * 1000;
       try { localStorage.setItem("google_logged_in", "true"); } catch(e) {}
       showApp();
@@ -261,6 +260,23 @@ function initGoogleAuth() {
     const savedKey = localStorage.getItem("anthropic_key");
     if (loggedIn && savedKey) {
       ANTHROPIC_API_KEY = savedKey;
+      // コールバックが呼ばれなかった場合のフォールバック（5秒）
+      const silentTimeout = setTimeout(() => {
+        if (!accessToken) {
+          document.getElementById("login-screen").style.display = "flex";
+        }
+      }, 5000);
+      tokenClient.callback = (resp) => {
+        clearTimeout(silentTimeout);
+        if (resp.error) {
+          document.getElementById("login-screen").style.display = "flex";
+          return;
+        }
+        accessToken = resp.access_token;
+        tokenExpiresAt = Date.now() + (resp.expires_in - 120) * 1000;
+        try { localStorage.setItem("google_logged_in", "true"); } catch(e) {}
+        showApp();
+      };
       tokenClient.requestAccessToken({ prompt: "" });
       return;
     }
