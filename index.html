@@ -148,6 +148,15 @@ body {
 </head>
 <body>
 
+<!-- Loading Screen -->
+<div id="loading-screen" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;width:100%;gap:16px;">
+  <div style="width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#4299e1,#48bb78);display:flex;align-items:center;justify-content:center;font-size:26px;">🗓</div>
+  <div style="color:#718096;font-size:13px;">読み込み中...</div>
+  <div style="display:flex;gap:5px;margin-top:4px;">
+    <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+  </div>
+</div>
+
 <!-- Login Screen -->
 <div id="login-screen" style="display:none">
   <div id="login-card">
@@ -231,6 +240,7 @@ window.onload = () => {
       initGoogleAuth();
     } else if (waited >= 10000) {
       clearInterval(waitForGSI);
+      document.getElementById("loading-screen").style.display = "none";
       document.getElementById("login-screen").style.display = "flex";
       alert("Googleの認証ライブラリの読み込みに失敗しました。ネットワークを確認してください。");
     }
@@ -263,11 +273,13 @@ function initGoogleAuth() {
       // コールバックが呼ばれなかった場合のフォールバック（5秒）
       const silentTimeout = setTimeout(() => {
         if (!accessToken) {
+          document.getElementById("loading-screen").style.display = "none";
           document.getElementById("login-screen").style.display = "flex";
         }
       }, 5000);
       tokenClient.callback = (resp) => {
         clearTimeout(silentTimeout);
+        document.getElementById("loading-screen").style.display = "none";
         if (resp.error) {
           document.getElementById("login-screen").style.display = "flex";
           return;
@@ -283,6 +295,7 @@ function initGoogleAuth() {
   } catch(e) {}
 
   // 未ログインならログイン画面を表示
+  document.getElementById("loading-screen").style.display = "none";
   document.getElementById("login-screen").style.display = "flex";
 }
 
