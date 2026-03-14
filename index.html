@@ -401,6 +401,7 @@ async function propose() {
   document.getElementById("input-box").value = "";
   addMsg(text, "user");
   setLoading(true);
+  let intent = "add"; // tryの外で宣言してcatchからも参照できるようにする
   try {
     const { iso, label } = getJSTDate();
 
@@ -408,7 +409,7 @@ async function propose() {
     const intentSys = "あなたはスケジュール管理アプリのアシスタントです。ユーザーのメッセージが「予定の閲覧・確認」を求めているか「予定の新規登録」を求めているかを判定してください。閲覧なら <intent>view</intent>、登録なら <intent>add</intent> とだけ答えてください。今日の日付(JST): " + label + " (" + iso + ")";
     const intentRaw = await callClaude(intentSys, text);
     const intentMatch = intentRaw.match(/<intent>(.*?)<\/intent>/);
-    const intent = intentMatch ? intentMatch[1].trim() : "add";
+    intent = intentMatch ? intentMatch[1].trim() : "add";
 
     if (intent === "view") {
       await handleView(text, iso, label);
