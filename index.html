@@ -429,7 +429,7 @@ async function propose() {
     const intentSys = "あなたはスケジュール管理アプリのアシスタントです。ユーザーのメッセージの意図を判定してください。" +
       "予定の閲覧・確認なら <intent>view</intent>、" +
       "予定の新規登録なら <intent>add</intent>、" +
-      "既存の予定の変更・修正・更新なら <intent>edit</intent> とだけ答えてください。" +
+      "既存の予定・タスクの変更・修正・更新・メモ追加・時間変更・タイトル変更なら <intent>edit</intent> とだけ答えてください。" +
       "今日の日付(JST): " + label + " (" + iso + ")";
     const intentRaw = await callClaude(intentSys, text);
     const intentMatch = intentRaw.match(/<intent>(.*?)<\/intent>/);
@@ -678,6 +678,12 @@ async function handleEdit(text, iso, label) {
 
   if (allItems.length === 0) {
     addMsg("該当する予定・タスクが見つかりませんでした。期間やキーワードを変えて再度お試しください。", "assistant");
+    return;
+  }
+
+  // 1件のみの場合は自動選択
+  if (allItems.length === 1) {
+    selectEventToEdit(allItems[0]);
     return;
   }
 
