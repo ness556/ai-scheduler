@@ -223,6 +223,9 @@ let accessToken = "";
 let tokenExpiresAt = 0;
 let proposals = [];
 let tokenClient;
+// 予定変更フロー管理
+// { step: "selecting"|"editing"|"confirming", event: {...}, changes: {...} }
+let editState = null;
 
 // ===== Google OAuth =====
 window.onload = () => {
@@ -405,19 +408,31 @@ async function propose() {
   try {
     const { iso, label } = getJSTDate();
 
-    // まず意図を判定（予定追加 or 閲覧）
-    const intentSys = "あなたはスケジュール管理アプリのアシスタントです。ユーザーのメッセージが「予定の閲覧・確認」を求めているか「予定の新規登録」を求めているかを判定してください。閲覧なら <intent>view</intent>、登録なら <intent>add</intent> とだけ答えてください。今日の日付(JST): " + label + " (" + iso + ")";
+    if (editState?.step === "editing") {
+      // 変更内容を受け取るフェーズ中は意図判定をスキップして直接処理
+      intent = "edit";
+      await handleEditDetails(text, iso);
+    } else {
+    // まず意図を判定（予定追加 or 閲覧 or 変更）
+    const intentSys = "あなたはスケジュール管理アプリのアシスタントです。ユーザーのメッセージの意図を判定してください。" +
+      "予定の閲覧・確認なら <intent>view</intent>、" +
+      "予定の新規登録なら <intent>add</intent>、" +
+      "既存の予定の変更・修正・更新なら <intent>edit</intent> とだけ答えてください。" +
+      "今日の日付(JST): " + label + " (" + iso + ")";
     const intentRaw = await callClaude(intentSys, text);
     const intentMatch = intentRaw.match(/<intent>(.*?)<\/intent>/);
     intent = intentMatch ? intentMatch[1].trim() : "add";
 
     if (intent === "view") {
       await handleView(text, iso, label);
+    } else if (intent === "edit") {
+      await handleEdit(text, iso, label);
     } else {
       await handleAdd(text, iso, label);
     }
+    } // end of intent detection else block
   } catch(e) {
-    await showError(e.message, intent === "view" ? "view" : "propose");
+    await showError(e.message, intent === "view" ? "view" : intent === "edit" ? "edit" : "propose");
   } finally {
     setLoading(false);
   }
@@ -457,22 +472,54 @@ async function handleView(text, iso, label) {
   const data = await res.json();
   const events = data.items || [];
 
-  if (events.length === 0) {
-    addMsg("📅 この期間には予定が見つかりませんでした。", "assistant");
+  // Google Tasks APIで取得（期限が期間内のもの）
+  const taskListId = await getDefaultTaskList();
+  const taskRes = await fetch(
+    "https://tasks.googleapis.com/tasks/v1/lists/" + taskListId + "/tasks?maxResults=100&showCompleted=false",
+    { headers: { "Authorization": "Bearer " + accessToken } }
+  );
+  let tasks = [];
+  if (taskRes.ok) {
+    const taskData = await taskRes.json();
+    const start = new Date(startDate + "T00:00:00+09:00");
+    const end = new Date(endDate + "T23:59:59+09:00");
+    tasks = (taskData.items || []).filter(t => {
+      if (!t.title) return false;
+      if (!t.due) return true; // 期限未設定タスクも含める
+      const due = new Date(t.due);
+      return due >= start && due <= end;
+    });
+  }
+
+  if (events.length === 0 && tasks.length === 0) {
+    addMsg("📅 この期間には予定・タスクが見つかりませんでした。", "assistant");
     return;
   }
 
   // AIに整形させる
-  const formatSys = "あなたはスケジュール管理アシスタントです。イベント一覧を見やすい日本語でまとめてください。日付・時間・タイトル・メモ（あれば）を整理して表示してください。";
+  const formatSys = "あなたはスケジュール管理アシスタントです。カレンダー予定とタスク一覧を見やすい日本語でまとめてください。予定とタスクをセクション分けして、日付・時間・タイトル・メモ（あれば）を整理して表示してください。";
+
   const eventsText = events.map(e => {
     const start = e.start?.dateTime || e.start?.date || "";
     const startLabel = start.includes("T")
       ? new Date(start).toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"})
       : new Date(start + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
-    return startLabel + " 「" + e.summary + "」" + (e.description ? " メモ: " + e.description : "");
+    return "📅 " + startLabel + " 「" + e.summary + "」" + (e.description ? " メモ: " + e.description : "");
   }).join("\n");
 
-  const summary = await callClaude(formatSys, "以下の予定一覧を整形してください:\n" + eventsText);
+  const tasksText = tasks.map(t => {
+    const dueLabel = t.due
+      ? new Date(t.due).toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"})
+      : "期限なし";
+    return "✅ " + dueLabel + " 「" + t.title + "」" + (t.notes ? " メモ: " + t.notes : "");
+  }).join("\n");
+
+  const combined = [
+    events.length > 0 ? "【カレンダー予定】\n" + eventsText : "",
+    tasks.length > 0 ? "【タスク】\n" + tasksText : "",
+  ].filter(Boolean).join("\n\n");
+
+  const summary = await callClaude(formatSys, "以下の一覧を整形してください:\n" + combined);
   addMsg(summary, "assistant");
 }
 
@@ -556,6 +603,300 @@ function cancelProposals() {
   document.getElementById("proposals-area").style.display = "none";
 }
 
+// ===== 予定の変更 =====
+async function handleEdit(text, iso, label) {
+  // AIに検索キーワードと期間を判定させる
+  const searchSys = "今日の日付(JST): " + label + " (" + iso + ") " +
+    "ユーザーが変更したい予定を特定するため、検索に使うキーワードと期間を判定してください。" +
+    "<keyword>イベント名や関連語</keyword><range>開始ISO日付,終了ISO日付</range> の形式で答えてください。" +
+    "期間が不明なら今日から2週間後までを使ってください。";
+  const searchRaw = await callClaude(searchSys, text);
+  const kwMatch = searchRaw.match(/<keyword>(.*?)<\/keyword>/);
+  const rangeMatch = searchRaw.match(/<range>(.*?),(.*?)<\/range>/);
+
+  const keyword = kwMatch ? kwMatch[1].trim() : "";
+  const startDate = rangeMatch ? rangeMatch[1].trim() : iso;
+  const endDate = rangeMatch ? rangeMatch[2].trim() : (() => {
+    const d = new Date(iso); d.setDate(d.getDate() + 14);
+    return d.toISOString().slice(0,10);
+  })();
+
+  await ensureToken();
+
+  // カレンダーイベントを検索
+  const calParams = new URLSearchParams({
+    timeMin: startDate + "T00:00:00+09:00",
+    timeMax: endDate + "T23:59:59+09:00",
+    singleEvents: "true",
+    orderBy: "startTime",
+    maxResults: "20",
+    q: keyword,
+  });
+  const calRes = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events?" + calParams, {
+    headers: { "Authorization": "Bearer " + accessToken },
+  });
+  if (!calRes.ok) {
+    const err = await calRes.json();
+    throw new Error("カレンダー取得失敗: " + (err.error?.message || calRes.status));
+  }
+  const calData = await calRes.json();
+  const calEvents = (calData.items || []).filter(e => e.summary).map(e => ({...e, _type: "calendar"}));
+
+  // タスクを検索
+  const taskListId = await getDefaultTaskList();
+  const taskRes = await fetch(
+    "https://tasks.googleapis.com/tasks/v1/lists/" + taskListId + "/tasks?maxResults=100&showCompleted=false",
+    { headers: { "Authorization": "Bearer " + accessToken } }
+  );
+  let taskItems = [];
+  if (taskRes.ok) {
+    const taskData = await taskRes.json();
+    const kw = keyword.toLowerCase();
+    taskItems = (taskData.items || [])
+      .filter(t => t.title && (!kw || t.title.toLowerCase().includes(kw)))
+      .map(t => ({...t, _type: "task"}));
+  }
+
+  const allItems = [...calEvents, ...taskItems];
+
+  if (allItems.length === 0) {
+    addMsg("該当する予定・タスクが見つかりませんでした。期間やキーワードを変えて再度お試しください。", "assistant");
+    return;
+  }
+
+  addMsg("変更したい予定・タスクを選んでください：", "assistant");
+  renderEditCandidates(allItems);
+}
+
+function renderEditCandidates(allItems) {
+  // 既存の候補エリアを削除
+  document.getElementById("edit-candidates")?.remove();
+
+  const area = document.createElement("div");
+  area.id = "edit-candidates";
+  area.style.cssText = "width:100%;max-width:660px;padding:0 16px 8px;display:flex;flex-direction:column;gap:8px;";
+
+  allItems.forEach(ev => {
+    const isTask = ev._type === "task";
+    let timeLabel = "";
+    if (!isTask) {
+      const start = ev.start?.dateTime || ev.start?.date || "";
+      timeLabel = start.includes("T")
+        ? new Date(start).toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"})
+        : new Date(start + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+    } else if (ev.due) {
+      timeLabel = new Date(ev.due).toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+    }
+    const title = isTask ? ev.title : ev.summary;
+    const memo = isTask ? ev.notes : ev.description;
+    const typeIcon = isTask ? "✅ タスク" : "📅 予定";
+    const borderColor = isTask ? "rgba(72,187,120,0.3)" : "rgba(255,255,255,0.1)";
+
+    const card = document.createElement("div");
+    card.style.cssText = "background:rgba(255,255,255,0.04);border:1px solid " + borderColor + ";border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:12px;";
+    card.innerHTML = `
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:14px;">${title}</div>
+        <div style="color:#718096;font-size:12px;margin-top:3px;">${isTask ? "✅ " : "🕐 "}${timeLabel || typeIcon}</div>
+        ${memo ? '<div style="color:#4a5568;font-size:11px;margin-top:2px;">📝 ' + memo + '</div>' : ""}
+      </div>
+      <button onclick="selectEventToEdit(${JSON.stringify(ev).replace(/"/g,'&quot;')})"
+        style="flex-shrink:0;background:rgba(66,153,225,0.15);color:#4299e1;border:1px solid rgba(66,153,225,0.4);border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;font-weight:700;font-family:inherit;">
+        変更する
+      </button>
+    `;
+    area.appendChild(card);
+  });
+
+  // キャンセルボタン
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "キャンセル";
+  cancelBtn.style.cssText = "background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.09);border-radius:10px;padding:10px;color:#718096;font-size:13px;cursor:pointer;font-family:inherit;";
+  cancelBtn.onclick = () => { editState = null; area.remove(); };
+  area.appendChild(cancelBtn);
+
+  // メッセージエリアの後ろに挿入
+  const messages = document.getElementById("messages");
+  messages.after(area);
+  area.scrollIntoView({behavior:"smooth"});
+}
+
+function selectEventToEdit(ev) {
+  editState = { step: "editing", event: ev };
+  document.getElementById("edit-candidates")?.remove();
+
+  const isTask = ev._type === "task";
+  const title = isTask ? ev.title : ev.summary;
+
+  let timeLabel = "";
+  if (!isTask) {
+    const start = ev.start?.dateTime || ev.start?.date || "";
+    timeLabel = start.includes("T")
+      ? new Date(start).toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"})
+      : new Date(start + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+  } else if (ev.due) {
+    timeLabel = new Date(ev.due).toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+  }
+
+  const hint = isTask
+    ? "例：「タイトルを〇〇に変更」「期限を明日に変更」「メモを追加」"
+    : "例：「16時に変更」「タイトルを〇〇に変更」「メモを追加」";
+
+  addMsg("「" + title + "」（" + (timeLabel || (isTask ? "タスク" : "予定")) + "）を選択しました。\nどのように変更しますか？\n" + hint, "assistant");
+  document.getElementById("input-box").focus();
+}
+
+async function handleEditDetails(text, iso) {
+  const ev = editState.event;
+  const isTask = ev._type === "task";
+
+  let editSys, hint;
+  if (isTask) {
+    editSys = "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + iso + " " +
+      "以下の既存タスクに対してユーザーが求める変更を解析し、<changes>...</changes>タグでJSONを返してください。" +
+      "変更がないフィールドは含めないでください。" +
+      'JSON形式: {"title":"新タイトル","dueDate":"2025-01-01","notes":"新メモ"}' +
+      "既存タスク: タイトル=\"" + ev.title + "\", 期限=\"" + (ev.due||"") + "\", メモ=\"" + (ev.notes||"") + "\"";
+    hint = "例：「タイトルを〇〇に変更」「期限を明日に変更」";
+  } else {
+    const start = ev.start?.dateTime || ev.start?.date || "";
+    editSys = "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + iso + " " +
+      "以下の既存イベントに対してユーザーが求める変更を解析し、<changes>...</changes>タグでJSONを返してください。" +
+      "変更がないフィールドは含めないでください。" +
+      'JSON形式: {"title":"新タイトル","startISO":"2025-01-01T10:00:00","endISO":"2025-01-01T11:00:00","description":"新メモ","reminderMinutes":10}' +
+      "既存イベント: タイトル=\"" + ev.summary + "\", 開始=\"" + start + "\", メモ=\"" + (ev.description||"") + "\"";
+    hint = "例：「16時に変更」「タイトルを〇〇に変更」";
+  }
+
+  const raw = await callClaude(editSys, text);
+  const match = raw.match(/<changes>([\s\S]*?)<\/changes>/);
+  if (!match) {
+    addMsg("変更内容を正しく解析できませんでした。もう一度教えてください。\n" + hint, "assistant");
+    return;
+  }
+
+  const changes = JSON.parse(match[1]);
+  editState = { ...editState, step: "confirming", changes };
+  renderEditConfirm(ev, changes);
+}
+
+function renderEditConfirm(ev, changes) {
+  document.getElementById("edit-confirm")?.remove();
+
+  const area = document.createElement("div");
+  area.id = "edit-confirm";
+  area.style.cssText = "width:100%;max-width:660px;padding:0 16px 8px;display:flex;flex-direction:column;gap:8px;";
+
+  const isTask = ev._type === "task";
+  const lines = ["以下の内容に変更します：\n"];
+  if (changes.title) lines.push("📌 タイトル: " + changes.title);
+  if (isTask) {
+    if (changes.dueDate) lines.push("📅 期限: " + new Date(changes.dueDate + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"}));
+    if (changes.notes !== undefined) lines.push("📝 メモ: " + (changes.notes || "（削除）"));
+  } else {
+    if (changes.startISO) lines.push("🕐 開始: " + new Date(changes.startISO + "+09:00").toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"}));
+    if (changes.endISO) lines.push("🕐 終了: " + new Date(changes.endISO + "+09:00").toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"}));
+    if (changes.description !== undefined) lines.push("📝 メモ: " + (changes.description || "（削除）"));
+    if (changes.reminderMinutes) lines.push("🔔 通知: " + (changes.reminderMinutes >= 60 ? changes.reminderMinutes/60 + "時間前" : changes.reminderMinutes + "分前"));
+  }
+
+  addMsg(lines.join("\n"), "assistant");
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;gap:8px;";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.textContent = "変更する";
+  confirmBtn.style.cssText = "flex:1;background:linear-gradient(135deg,#4299e1,#48bb78);border:none;border-radius:10px;padding:12px;color:#fff;font-weight:700;font-size:14px;cursor:pointer;font-family:inherit;";
+  confirmBtn.onclick = () => applyEdit(ev, changes, area);
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "キャンセル";
+  cancelBtn.style.cssText = "background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.09);border-radius:10px;padding:12px 16px;color:#718096;font-size:13px;cursor:pointer;font-family:inherit;";
+  cancelBtn.onclick = () => { editState = null; area.remove(); };
+
+  btnRow.appendChild(confirmBtn);
+  btnRow.appendChild(cancelBtn);
+  area.appendChild(btnRow);
+
+  document.getElementById("messages").after(area);
+  area.scrollIntoView({behavior:"smooth"});
+}
+
+async function applyEdit(ev, changes, areaEl) {
+  areaEl.remove();
+  editState = null;
+  setLoading(true);
+  const bubble = addMsg("変更中...", "assistant");
+
+  try {
+    await ensureToken();
+    const isTask = ev._type === "task";
+
+    if (isTask) {
+      // タスクの変更
+      const taskListId = await getDefaultTaskList();
+      const getRes = await fetch("https://tasks.googleapis.com/tasks/v1/lists/" + taskListId + "/tasks/" + ev.id, {
+        headers: { "Authorization": "Bearer " + accessToken },
+      });
+      if (!getRes.ok) {
+        const err = await getRes.json();
+        throw new Error("タスク取得失敗: " + (err.error?.message || getRes.status));
+      }
+      const existing = await getRes.json();
+      const body = { ...existing };
+      if (changes.title) body.title = changes.title;
+      if (changes.notes !== undefined) body.notes = changes.notes;
+      if (changes.dueDate) body.due = changes.dueDate + "T00:00:00Z";
+
+      const res = await fetch("https://tasks.googleapis.com/tasks/v1/lists/" + taskListId + "/tasks/" + ev.id, {
+        method: "PUT",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error("タスク変更失敗: " + (err.error?.message || res.status));
+      }
+    } else {
+      // カレンダーイベントの変更
+      const getRes = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events/" + ev.id, {
+        headers: { "Authorization": "Bearer " + accessToken },
+      });
+      if (!getRes.ok) {
+        const err = await getRes.json();
+        throw new Error("イベント取得失敗: " + (err.error?.message || getRes.status));
+      }
+      const existing = await getRes.json();
+      const body = { ...existing };
+      if (changes.title) body.summary = changes.title;
+      if (changes.description !== undefined) body.description = changes.description;
+      if (changes.startISO) body.start = { dateTime: changes.startISO + "+09:00", timeZone: "Asia/Tokyo" };
+      if (changes.endISO) body.end = { dateTime: changes.endISO + "+09:00", timeZone: "Asia/Tokyo" };
+      if (changes.reminderMinutes) {
+        body.reminders = { useDefault: false, overrides: [{ method: "popup", minutes: changes.reminderMinutes }] };
+      }
+
+      const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events/" + ev.id, {
+        method: "PUT",
+        headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error("変更失敗: " + (err.error?.message || res.status));
+      }
+    }
+
+    bubble.textContent = "✅ " + (ev._type === "task" ? "タスク" : "予定") + "を変更しました！";
+  } catch(e) {
+    bubble.remove();
+    await showError(e.message, "edit");
+  } finally {
+    setLoading(false);
+  }
+}
+
 // ===== Google Calendar API =====
 async function createCalendarEvent(p) {
   await ensureToken();
@@ -620,7 +961,7 @@ async function createTaskWithList(p, listId) {
 
 // ===== エラー表示 + AI分析 =====
 async function showError(errorMsg, context) {
-  const contextLabel = context === "propose" ? "提案リクエスト" : context === "view" ? "スケジュール閲覧" : "Google登録";
+  const contextLabel = context === "propose" ? "提案リクエスト" : context === "view" ? "スケジュール閲覧" : context === "edit" ? "予定の変更" : "Google登録";
   const bubble = addMsg(
     "❌ エラーが発生しました\n\n" +
     "【エラー内容】\n" + errorMsg + "\n\n" +
