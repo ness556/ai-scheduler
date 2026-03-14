@@ -577,7 +577,7 @@ function renderProposals() {
     card.innerHTML = `
       <div style="flex:1">
         <div class="p-title">${p.title}</div>
-        <div class="p-time">${isSched ? "🕐 "+(p.suggestedTime||"") : "📋 Googleタスクに追加"}</div>
+        <div class="p-time">${isSched ? "🕐 " + (p.startISO ? new Date(p.startISO+"+09:00").toLocaleDateString("ja-JP",{month:"numeric",day:"numeric",weekday:"short"}) + " " : "") + (p.suggestedTime||"") : "📋 Googleタスクに追加"}</div>
         ${p.reason ? '<div class="p-reason">'+p.reason+'</div>' : ""}
         <div class="p-notify">${reminderLabel}</div>
         <textarea
