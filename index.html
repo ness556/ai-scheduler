@@ -470,11 +470,9 @@ async function handleView(text, iso, label) {
       ? new Date(start).toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"})
       : new Date(start + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
     return startLabel + " 「" + e.summary + "」" + (e.description ? " メモ: " + e.description : "");
-  }).join("
-");
+  }).join("\n");
 
-  const summary = await callClaude(formatSys, "以下の予定一覧を整形してください:
-" + eventsText);
+  const summary = await callClaude(formatSys, "以下の予定一覧を整形してください:\n" + eventsText);
   addMsg(summary, "assistant");
 }
 
