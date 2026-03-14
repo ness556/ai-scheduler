@@ -578,6 +578,7 @@ function renderProposals() {
         ${p.reason ? '<div class="p-reason">'+p.reason+'</div>' : ""}
         <div class="p-notify">${reminderLabel}</div>
         <textarea
+          id="desc-${p.id}"
           placeholder="📝 メモを追加（任意）"
           oninput="updateDescription(${p.id}, this.value)"
           style="margin-top:6px;width:100%;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 10px;color:#cbd5e0;font-size:12px;font-family:inherit;resize:none;outline:none;line-height:1.5;"
@@ -1013,6 +1014,11 @@ async function showError(errorMsg, context) {
 // ===== Register all =====
 async function register() {
   if (!proposals.length) return;
+  // 登録直前にDOMから直接メモの値を同期（iOSでoninputが発火しない場合の対策）
+  proposals = proposals.map(p => {
+    const el = document.getElementById("desc-" + p.id);
+    return el ? {...p, description: el.value} : p;
+  });
   document.getElementById("proposals-area").style.display = "none";
   setLoading(true);
   const bubble = addMsg("Googleに登録中...", "assistant");
