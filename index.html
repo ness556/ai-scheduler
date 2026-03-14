@@ -213,9 +213,21 @@ const pad = n => String(n).padStart(2,"0");
 function getJSTDate() {
   const now = new Date();
   const jst = new Date(now.getTime() + (9*60 + now.getTimezoneOffset()) * 60000);
+  const iso = jst.getFullYear()+"-"+pad(jst.getMonth()+1)+"-"+pad(jst.getDate());
+
+  // 今週の月曜〜日曜を計算（月曜始まり）
+  const dow = jst.getDay(); // 0=日,1=月,...,6=土
+  const diffToMon = (dow === 0) ? -6 : 1 - dow; // 日曜なら-6、それ以外は1-dow
+  const mon = new Date(jst); mon.setDate(jst.getDate() + diffToMon);
+  const sun = new Date(mon); sun.setDate(mon.getDate() + 6);
+  const weekStart = mon.getFullYear()+"-"+pad(mon.getMonth()+1)+"-"+pad(mon.getDate());
+  const weekEnd   = sun.getFullYear()+"-"+pad(sun.getMonth()+1)+"-"+pad(sun.getDate());
+
   return {
-    iso: jst.getFullYear()+"-"+pad(jst.getMonth()+1)+"-"+pad(jst.getDate()),
-    label: jst.toLocaleDateString("ja-JP",{year:"numeric",month:"long",day:"numeric",weekday:"long"})
+    iso,
+    label: jst.toLocaleDateString("ja-JP",{year:"numeric",month:"long",day:"numeric",weekday:"long"}),
+    weekStart,
+    weekEnd,
   };
 }
 
@@ -441,10 +453,12 @@ async function propose() {
 // ===== 予定の閲覧 =====
 async function handleView(text, iso, label) {
   // AIに期間を判定させる
+  const { weekStart, weekEnd } = getJSTDate();
   const rangeSys = "今日の日付(JST): " + label + " (" + iso + ") " +
+    "週は月曜始まりです。今週は " + weekStart + "（月）〜" + weekEnd + "（日）です。" +
     "ユーザーが見たい期間を判定し、<range>開始ISO日付,終了ISO日付</range> の形式で答えてください。" +
     "例: 今日なら <range>" + iso + "," + iso + "</range>、" +
-    "今週（月〜日）なら月曜〜日曜のISO日付、今月なら月初〜月末のISO日付。" +
+    "今週なら <range>" + weekStart + "," + weekEnd + "</range>、今月なら月初〜月末のISO日付。" +
     "「3月」のような月指定は該当月の1日〜末日。";
   const rangeRaw = await callClaude(rangeSys, text);
   const rangeMatch = rangeRaw.match(/<range>(.*?),(.*?)<\/range>/);
@@ -606,7 +620,9 @@ function cancelProposals() {
 // ===== 予定の変更 =====
 async function handleEdit(text, iso, label) {
   // AIに検索キーワードと期間を判定させる
+  const { weekStart: ws, weekEnd: we } = getJSTDate();
   const searchSys = "今日の日付(JST): " + label + " (" + iso + ") " +
+    "週は月曜始まりです。今週は " + ws + "（月）〜" + we + "（日）です。" +
     "ユーザーが変更したい予定を特定するため、検索に使うキーワードと期間を判定してください。" +
     "<keyword>イベント名や関連語</keyword><range>開始ISO日付,終了ISO日付</range> の形式で答えてください。" +
     "期間が不明なら今日から2週間後までを使ってください。";
