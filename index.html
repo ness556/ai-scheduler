@@ -93,7 +93,7 @@ body {
 #proposals-label { font-size: 12px; color: #718096; font-weight: 600; }
 .proposal-card {
   background: rgba(255,255,255,0.04); border-radius: 12px;
-  padding: 12px 14px; display: flex; gap: 12px; align-items: center;
+  padding: 12px 14px; display: flex; gap: 12px; align-items: flex-start;
 }
 .p-title { font-weight: 600; font-size: 14px; }
 .p-time { color: #718096; font-size: 12px; margin-top: 3px; }
@@ -407,9 +407,10 @@ async function propose() {
     const PROPOSE_SYS = [
       "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + label + " (" + iso + ")",
       "ユーザーの予定を解析し、日本語の説明文に続けて <json>...</json> タグでJSONを出力してください。",
-      'JSON形式: {"proposals":[{"id":1,"title":"タイトル","suggestedTime":"07:00~07:30","startISO":"' + iso + 'T07:00:00","endISO":"' + iso + 'T07:30:00","type":"schedule","reason":"理由","reminderMinutes":10}]}',
+      'JSON形式: {"proposals":[{"id":1,"title":"タイトル","suggestedTime":"07:00~07:30","startISO":"' + iso + 'T07:00:00","endISO":"' + iso + 'T07:30:00","type":"schedule","reason":"理由","reminderMinutes":10,"description":""}]}',
       "typeはschedule(時刻が決まっているもの)またはtodo(タスク的・時刻不明)。時間不明なら朝から順に推測。",
       "reminderMinutesはユーザーが通知時間を指定した場合はその値（例：1時間前なら60）、指定がなければ10。",
+      "descriptionはユーザーがメモや備考を指定した場合にその内容を入れる。なければ空文字。",
       "最後に「内容を確認して登録ボタンを押してください」と案内してください。"
     ].join(" ");
 
@@ -446,6 +447,12 @@ function renderProposals() {
         <div class="p-time">${isSched ? "🕐 "+(p.suggestedTime||"") : "📋 Googleタスクに追加"}</div>
         ${p.reason ? '<div class="p-reason">'+p.reason+'</div>' : ""}
         <div class="p-notify">${reminderLabel}</div>
+        <textarea
+          placeholder="📝 メモを追加（任意）"
+          oninput="updateDescription(${p.id}, this.value)"
+          style="margin-top:6px;width:100%;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:6px 10px;color:#cbd5e0;font-size:12px;font-family:inherit;resize:none;outline:none;line-height:1.5;"
+          rows="2"
+        >${p.description||""}</textarea>
       </div>
       <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
         <button class="type-btn ${p.type}" onclick="toggleType(${p.id})">${isSched ? "📅 予定" : "✅ TODO"}</button>
@@ -471,6 +478,10 @@ function deleteProposal(id) {
   }
 }
 
+function updateDescription(id, value) {
+  proposals = proposals.map(p => p.id === id ? {...p, description: value} : p);
+}
+
 function cancelProposals() {
   proposals = [];
   document.getElementById("proposals-area").style.display = "none";
@@ -481,6 +492,7 @@ async function createCalendarEvent(p) {
   await ensureToken();
   const body = {
     summary: p.title,
+    description: p.description || "",
     start: { dateTime: p.startISO + "+09:00", timeZone: "Asia/Tokyo" },
     end:   { dateTime: p.endISO   + "+09:00", timeZone: "Asia/Tokyo" },
     reminders: {
@@ -519,6 +531,7 @@ async function createTaskWithList(p, listId) {
   const dueDate = p.startISO ? p.startISO.slice(0, 10) : getJSTDate().iso;
   const body = {
     title: p.title,
+    notes: p.description || "",
     due: dueDate + "T00:00:00Z",
   };
   const res = await fetch("https://tasks.googleapis.com/tasks/v1/lists/" + listId + "/tasks", {
