@@ -402,29 +402,99 @@ async function propose() {
   addMsg(text, "user");
   setLoading(true);
   try {
-    // 毎回最新の日付で提案
     const { iso, label } = getJSTDate();
-    const PROPOSE_SYS = [
-      "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + label + " (" + iso + ")",
-      "ユーザーの予定を解析し、日本語の説明文に続けて <json>...</json> タグでJSONを出力してください。",
-      'JSON形式: {"proposals":[{"id":1,"title":"タイトル","suggestedTime":"07:00~07:30","startISO":"' + iso + 'T07:00:00","endISO":"' + iso + 'T07:30:00","type":"schedule","reason":"理由","reminderMinutes":10,"description":""}]}',
-      "typeはschedule(時刻が決まっているもの)またはtodo(タスク的・時刻不明)。時間不明なら朝から順に推測。",
-      "reminderMinutesはユーザーが通知時間を指定した場合はその値（例：1時間前なら60）、指定がなければ10。",
-      "descriptionはユーザーがメモや備考を指定した場合にその内容を入れる。なければ空文字。",
-      "最後に「内容を確認して登録ボタンを押してください」と案内してください。"
-    ].join(" ");
 
-    const fullText = await callClaude(PROPOSE_SYS, text);
-    const match = fullText.match(/<json>([\s\S]*?)<\/json>/);
-    const parsed = match ? JSON.parse(match[1]) : null;
-    const display = fullText.replace(/<json>[\s\S]*?<\/json>/g,"").trim();
-    if (parsed?.proposals?.length) { proposals = parsed.proposals; renderProposals(); }
-    addMsg(display || "提案しました！", "assistant");
+    // まず意図を判定（予定追加 or 閲覧）
+    const intentSys = "あなたはスケジュール管理アプリのアシスタントです。ユーザーのメッセージが「予定の閲覧・確認」を求めているか「予定の新規登録」を求めているかを判定してください。閲覧なら <intent>view</intent>、登録なら <intent>add</intent> とだけ答えてください。今日の日付(JST): " + label + " (" + iso + ")";
+    const intentRaw = await callClaude(intentSys, text);
+    const intentMatch = intentRaw.match(/<intent>(.*?)<\/intent>/);
+    const intent = intentMatch ? intentMatch[1].trim() : "add";
+
+    if (intent === "view") {
+      await handleView(text, iso, label);
+    } else {
+      await handleAdd(text, iso, label);
+    }
   } catch(e) {
-    await showError(e.message, "propose");
+    await showError(e.message, intent === "view" ? "view" : "propose");
   } finally {
     setLoading(false);
   }
+}
+
+// ===== 予定の閲覧 =====
+async function handleView(text, iso, label) {
+  // AIに期間を判定させる
+  const rangeSys = "今日の日付(JST): " + label + " (" + iso + ") " +
+    "ユーザーが見たい期間を判定し、<range>開始ISO日付,終了ISO日付</range> の形式で答えてください。" +
+    "例: 今日なら <range>" + iso + "," + iso + "</range>、" +
+    "今週（月〜日）なら月曜〜日曜のISO日付、今月なら月初〜月末のISO日付。" +
+    "「3月」のような月指定は該当月の1日〜末日。";
+  const rangeRaw = await callClaude(rangeSys, text);
+  const rangeMatch = rangeRaw.match(/<range>(.*?),(.*?)<\/range>/);
+  if (!rangeMatch) { addMsg("期間を正しく判定できませんでした。「今日の予定を見せて」のように話しかけてみてください。", "assistant"); return; }
+
+  const startDate = rangeMatch[1].trim();
+  const endDate = rangeMatch[2].trim();
+
+  // Google Calendar APIで取得
+  await ensureToken();
+  const params = new URLSearchParams({
+    timeMin: startDate + "T00:00:00+09:00",
+    timeMax: endDate + "T23:59:59+09:00",
+    singleEvents: "true",
+    orderBy: "startTime",
+    maxResults: "50",
+  });
+  const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events?" + params, {
+    headers: { "Authorization": "Bearer " + accessToken },
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error("カレンダー取得失敗: " + (err.error?.message || res.status));
+  }
+  const data = await res.json();
+  const events = data.items || [];
+
+  if (events.length === 0) {
+    addMsg("📅 この期間には予定が見つかりませんでした。", "assistant");
+    return;
+  }
+
+  // AIに整形させる
+  const formatSys = "あなたはスケジュール管理アシスタントです。イベント一覧を見やすい日本語でまとめてください。日付・時間・タイトル・メモ（あれば）を整理して表示してください。";
+  const eventsText = events.map(e => {
+    const start = e.start?.dateTime || e.start?.date || "";
+    const startLabel = start.includes("T")
+      ? new Date(start).toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"})
+      : new Date(start + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+    return startLabel + " 「" + e.summary + "」" + (e.description ? " メモ: " + e.description : "");
+  }).join("
+");
+
+  const summary = await callClaude(formatSys, "以下の予定一覧を整形してください:
+" + eventsText);
+  addMsg(summary, "assistant");
+}
+
+// ===== 予定の新規登録 =====
+async function handleAdd(text, iso, label) {
+  const PROPOSE_SYS = [
+    "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + label + " (" + iso + ")",
+    "ユーザーの予定を解析し、日本語の説明文に続けて <json>...</json> タグでJSONを出力してください。",
+    'JSON形式: {"proposals":[{"id":1,"title":"タイトル","suggestedTime":"07:00~07:30","startISO":"' + iso + 'T07:00:00","endISO":"' + iso + 'T07:30:00","type":"schedule","reason":"理由","reminderMinutes":10,"description":""}]}',
+    "typeはschedule(時刻が決まっているもの)またはtodo(タスク的・時刻不明)。時間不明なら朝から順に推測。",
+    "reminderMinutesはユーザーが通知時間を指定した場合はその値（例：1時間前なら60）、指定がなければ10。",
+    "descriptionはユーザーがメモや備考を指定した場合にその内容を入れる。なければ空文字。",
+    "最後に「内容を確認して登録ボタンを押してください」と案内してください。"
+  ].join(" ");
+
+  const fullText = await callClaude(PROPOSE_SYS, text);
+  const match = fullText.match(/<json>([\s\S]*?)<\/json>/);
+  const parsed = match ? JSON.parse(match[1]) : null;
+  const display = fullText.replace(/<json>[\s\S]*?<\/json>/g,"").trim();
+  if (parsed?.proposals?.length) { proposals = parsed.proposals; renderProposals(); }
+  addMsg(display || "提案しました！", "assistant");
 }
 
 // ===== Proposals UI =====
@@ -551,7 +621,7 @@ async function createTaskWithList(p, listId) {
 
 // ===== エラー表示 + AI分析 =====
 async function showError(errorMsg, context) {
-  const contextLabel = context === "propose" ? "提案リクエスト" : "Google登録";
+  const contextLabel = context === "propose" ? "提案リクエスト" : context === "view" ? "スケジュール閲覧" : "Google登録";
   const bubble = addMsg(
     "❌ エラーが発生しました\n\n" +
     "【エラー内容】\n" + errorMsg + "\n\n" +
