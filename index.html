@@ -541,8 +541,9 @@ async function handleView(text, iso, label) {
 
 // ===== 予定の新規登録 =====
 async function handleAdd(text, iso, label) {
+  const { weekStart, weekEnd } = getJSTDate();
   const PROPOSE_SYS = [
-    "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + label + " (" + iso + ")",
+    "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + label + " (" + iso + ") 週は月曜始まりです。今週は " + weekStart + "（月）〜" + weekEnd + "（日）です。来週は " + (() => { const d = new Date(weekStart); d.setDate(d.getDate()+7); return d.toISOString().slice(0,10); })() + "（月）〜" + (() => { const d = new Date(weekEnd); d.setDate(d.getDate()+7); return d.toISOString().slice(0,10); })() + "（日）です。",
     "ユーザーの予定を解析し、日本語の説明文に続けて <json>...</json> タグでJSONを出力してください。",
     'JSON形式: {"proposals":[{"id":1,"title":"タイトル","suggestedTime":"07:00~07:30","startISO":"' + iso + 'T07:00:00","endISO":"' + iso + 'T07:30:00","type":"schedule","reason":"理由","reminderMinutes":10,"description":""}]}',
     "typeはschedule(時刻が決まっているもの)またはtodo(タスク的・時刻不明)。時間不明なら朝から順に推測。",
