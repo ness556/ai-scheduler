@@ -760,11 +760,17 @@ async function handleEditDetails(text, iso) {
     hint = "例：「タイトルを〇〇に変更」「期限を明日に変更」";
   } else {
     const start = ev.start?.dateTime || ev.start?.date || "";
+    const end = ev.end?.dateTime || ev.end?.date || "";
+    // 元の所要時間を計算（分）
+    const durationMin = (start && end && start.includes("T") && end.includes("T"))
+      ? Math.round((new Date(end) - new Date(start)) / 60000)
+      : 60;
     editSys = "あなたはスケジュール管理アシスタントです。今日の日付(JST): " + iso + " " +
       "以下の既存イベントに対してユーザーが求める変更を解析し、<changes>...</changes>タグでJSONを返してください。" +
       "変更がないフィールドは含めないでください。" +
+      "【重要】開始時刻のみ変更する場合は、元の所要時間（" + durationMin + "分）を維持してendISOも必ず設定してください。" +
       'JSON形式: {"title":"新タイトル","startISO":"2025-01-01T10:00:00","endISO":"2025-01-01T11:00:00","description":"新メモ","reminderMinutes":10}' +
-      "既存イベント: タイトル=\"" + ev.summary + "\", 開始=\"" + start + "\", メモ=\"" + (ev.description||"") + "\"";
+      "既存イベント: タイトル=\"" + ev.summary + "\", 開始=\"" + start + "\", 終了=\"" + end + "\", メモ=\"" + (ev.description||"") + "\"";
     hint = "例：「16時に変更」「タイトルを〇〇に変更」";
   }
 
