@@ -438,7 +438,7 @@ async function propose() {
     if (intent === "view") {
       await handleView(text, iso, label);
     } else if (intent === "edit") {
-      await handleEdit(text, iso, label);
+      await handleEdit(text, iso, label, text); // originalTextを渡す
     } else {
       await handleAdd(text, iso, label);
     }
@@ -619,7 +619,7 @@ function cancelProposals() {
 }
 
 // ===== 予定の変更 =====
-async function handleEdit(text, iso, label) {
+async function handleEdit(text, iso, label, originalText) {
   // AIに検索キーワードと期間を判定させる
   const { weekStart: ws, weekEnd: we } = getJSTDate();
   const searchSys = "今日の日付(JST): " + label + " (" + iso + ") " +
@@ -683,7 +683,7 @@ async function handleEdit(text, iso, label) {
 
   // 1件のみの場合は自動選択
   if (allItems.length === 1) {
-    selectEventToEdit(allItems[0]);
+    await selectEventToEdit(allItems[0], originalText);
     return;
   }
 
@@ -744,7 +744,7 @@ function renderEditCandidates(allItems) {
   area.scrollIntoView({behavior:"smooth"});
 }
 
-function selectEventToEdit(ev) {
+async function selectEventToEdit(ev, originalText) {
   editState = { step: "editing", event: ev };
   document.getElementById("edit-candidates")?.remove();
 
@@ -761,11 +761,25 @@ function selectEventToEdit(ev) {
     timeLabel = new Date(ev.due).toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
   }
 
+  addMsg("「" + title + "」（" + (timeLabel || (isTask ? "タスク" : "予定")) + "）を選択しました。", "assistant");
+
+  // 最初のメッセージに変更内容が含まれていればそのまま処理
+  if (originalText) {
+    const { iso } = getJSTDate();
+    setLoading(true);
+    try {
+      await handleEditDetails(originalText, iso);
+    } finally {
+      setLoading(false);
+    }
+    return;
+  }
+
   const hint = isTask
     ? "例：「タイトルを〇〇に変更」「期限を明日に変更」「メモを追加」"
     : "例：「16時に変更」「タイトルを〇〇に変更」「メモを追加」";
 
-  addMsg("「" + title + "」（" + (timeLabel || (isTask ? "タスク" : "予定")) + "）を選択しました。\nどのように変更しますか？\n" + hint, "assistant");
+  addMsg("どのように変更しますか？\n" + hint, "assistant");
   document.getElementById("input-box").focus();
 }
 
