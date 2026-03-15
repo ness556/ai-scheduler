@@ -1216,13 +1216,17 @@ async function applyDelete(ev, areaEl) {
 async function handleComplete(text, iso, label) {
   const { weekStart: ws, weekEnd: we } = getJSTDate();
 
-  // キーワード抽出（曖昧な場合は空にして全件表示）
+  // キーワードと期間を抽出
   const searchSys = "今日の日付(JST): " + label + " (" + iso + ") " +
-    "ユーザーが完了にしたい特定のタスク名が含まれていれば <keyword>タスク名</keyword> の形式で答えてください。" +
-    "「今日のタスク」「タスクを完了した」など特定のタスク名が不明な場合は <keyword></keyword> と答えてください。";
+    "ユーザーが完了にしたいタスクについて以下を答えてください。" +
+    "特定のタスク名があれば <keyword>タスク名</keyword>、なければ <keyword></keyword>。" +
+    "「今日のタスク」など期間が指定されていれば <datefilter>today</datefilter>、" +
+    "「明日の」なら <datefilter>tomorrow</datefilter>、指定なしなら <datefilter>all</datefilter>。";
   const searchRaw = await callClaude(searchSys, text);
   const kwMatch = searchRaw.match(/<keyword>(.*?)<\/keyword>/);
+  const dfMatch = searchRaw.match(/<datefilter>(.*?)<\/datefilter>/);
   const keyword = kwMatch ? kwMatch[1].trim() : "";
+  const dateFilter = dfMatch ? dfMatch[1].trim() : "all";
 
   await ensureToken();
   const taskListId = await getDefaultTaskList();
@@ -1235,7 +1239,22 @@ async function handleComplete(text, iso, label) {
   const taskData = await taskRes.json();
   const kw = keyword.toLowerCase();
   const tasks = (taskData.items || [])
-    .filter(t => t.title && t.status !== "completed" && (!kw || t.title.toLowerCase().includes(kw)))
+    .filter(t => {
+      if (!t.title || t.status === "completed") return false;
+      if (kw && !t.title.toLowerCase().includes(kw)) return false;
+      // 期間フィルター
+      if (dateFilter === "today") {
+        if (!t.due) return false;
+        return t.due.slice(0,10) === iso;
+      }
+      if (dateFilter === "tomorrow") {
+        const tmr = new Date(iso); tmr.setDate(tmr.getDate()+1);
+        const tmrIso = tmr.toISOString().slice(0,10);
+        if (!t.due) return false;
+        return t.due.slice(0,10) === tmrIso;
+      }
+      return true; // all: 全件
+    })
     .map(t => ({...t, _type: "task"}));
 
   if (tasks.length === 0) {
