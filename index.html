@@ -507,6 +507,7 @@ async function handleView(text, iso, label) {
     const end = new Date(endDate + "T23:59:59+09:00");
     tasks = (taskData.items || []).filter(t => {
       if (!t.title) return false;
+      if (t.status === "completed") return false; // 完了済みは除外
       if (!t.due) return true; // 期限未設定タスクも含める
       const due = new Date(t.due);
       return due >= start && due <= end;
@@ -544,22 +545,65 @@ async function handleView(text, iso, label) {
   const summary = await callClaude(formatSys, "以下の一覧を整形してください:\n" + combined);
   addMsg(summary, "assistant");
 
-  // スケジュール分析・アドバイス
+  // スケジュール分析・アドバイス（来週分も追加取得）
   if (combined.length > 0) {
-    const { iso: todayIso, label: todayLabel } = getJSTDate();
+    const { iso: todayIso, label: todayLabel, weekEnd } = getJSTDate();
+
+    // 来週末までの追加データを取得してアドバイスの精度を上げる
+    const nextWeekEnd = (() => { const d = new Date(weekEnd); d.setDate(d.getDate()+7); return d.toISOString().slice(0,10); })();
+    let adviceCombined = combined;
+
+    // 表示期間が今日〜来週末に満たない場合は追加取得
+    if (endDate < nextWeekEnd) {
+      try {
+        await ensureToken();
+        const fwdParams = new URLSearchParams({
+          timeMin: endDate + "T00:00:00+09:00",
+          timeMax: nextWeekEnd + "T23:59:59+09:00",
+          singleEvents: "true", orderBy: "startTime", maxResults: "20",
+        });
+        const fwdRes = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events?" + fwdParams, {
+          headers: { "Authorization": "Bearer " + accessToken },
+        });
+        if (fwdRes.ok) {
+          const fwdData = await fwdRes.json();
+          const fwdEvents = (fwdData.items || []).filter(e => e.summary);
+          if (fwdEvents.length > 0) {
+            const fwdText = fwdEvents.map(e => {
+              const s = e.start?.dateTime || e.start?.date || "";
+              const sl = s.includes("T")
+                ? new Date(s).toLocaleString("ja-JP", {month:"numeric",day:"numeric",weekday:"short",hour:"2-digit",minute:"2-digit"})
+                : new Date(s + "T00:00:00+09:00").toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+              return "📅 " + sl + " 「" + e.summary + "」";
+            }).join("\n");
+            adviceCombined += "\n\n【来週以降の予定】\n" + fwdText;
+          }
+        }
+      } catch(e) { /* 追加取得失敗は無視 */ }
+    }
+
+    // タスクの完了状態を明示してAIに渡す
+    const taskStatusText = tasks.length > 0
+      ? "\n\n【タスクの状態】\n" + tasks.map(t =>
+          "・「" + t.title + "」完了状態: " + (t.status === "completed" ? "完了済み" : "未完了") +
+          (t.due ? "（期限: " + new Date(t.due).toLocaleDateString("ja-JP",{month:"numeric",day:"numeric"}) + "）" : "（期限なし）")
+        ).join("\n")
+      : "";
+
     const adviseSys = "あなたはスケジュール管理アシスタントです。" +
       "今日の日付(JST): " + todayLabel + " (" + todayIso + ") " +
       "以下のスケジュールとタスク一覧を見て、ユーザーへの実用的なアドバイスを日本語で提示してください。" +
-      "【重要なルール】" +
+      "【絶対に守るルール】" +
+      "・タスクの状態欄に「未完了」と書かれているタスクは必ず未完了です。完了済みと推測しないでください。" +
       "・期限が今日より後のタスクは未完了でも全く問題ありません。完了を急かすアドバイスは絶対にしないでください。" +
-      "・すでに期限が過ぎているタスクがあれば注意喚起してください。" +
+      "・すでに期限が過ぎている未完了タスクがあれば注意喚起してください。" +
       "以下の観点でアドバイスしてください：" +
-      "1. 今日または明日中にやっておくべき準備（例：明後日の会議の資料準備など）" +
-      "2. 今日が期限のタスクや、すでに期限切れのタスクへの注意喚起" +
-      "3. 予定の前後に入れておくと良い準備の提案（例：〇〇の前に△△を入れてはどうか）" +
+      "1. 今日または明日中にやっておくべき準備（来週の予定も考慮して）" +
+      "2. 今日が期限の未完了タスクや期限切れの未完了タスクへの注意喚起" +
+      "3. 来週の予定に向けて今週中に入れておくと良い準備の提案" +
       "アドバイスは箇条書きで3つ以内に絞り、具体的で実用的なものだけ提示してください。" +
       "特に指摘すべきことがなければ「特に急ぎの準備は不要です」と一言だけ返してください。";
-    const advice = await callClaude(adviseSys, "スケジュール一覧:\n" + combined);
+    const advice = await callClaude(adviseSys, "スケジュール一覧:\n" + adviceCombined + taskStatusText);
     addMsg("💡 アドバイス\n\n" + advice, "assistant");
   }
 }
@@ -698,7 +742,7 @@ async function handleEdit(text, iso, label, originalText) {
     const taskData = await taskRes.json();
     const kw = keyword.toLowerCase();
     taskItems = (taskData.items || [])
-      .filter(t => t.title && (!kw || t.title.toLowerCase().includes(kw)))
+      .filter(t => t.title && t.status !== "completed" && (!kw || t.title.toLowerCase().includes(kw)))
       .map(t => ({...t, _type: "task"}));
   }
 
@@ -1023,7 +1067,7 @@ async function handleDelete(text, iso, label) {
     const taskData = await taskRes.json();
     const kw = keyword.toLowerCase();
     taskItems = (taskData.items || [])
-      .filter(t => t.title && (!kw || t.title.toLowerCase().includes(kw)))
+      .filter(t => t.title && t.status !== "completed" && (!kw || t.title.toLowerCase().includes(kw)))
       .map(t => ({...t, _type: "task"}));
   }
 
