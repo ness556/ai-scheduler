@@ -433,7 +433,7 @@ async function propose() {
       "予定の新規登録なら <intent>add</intent>、" +
       "既存の予定・タスクの変更・修正・更新・メモ追加・時間変更・タイトル変更なら <intent>edit</intent>、" +
       "既存の予定・タスクの削除・取り消し・消去なら <intent>delete</intent>、" +
-      "タスクの完了・チェック・終了・済みにするなら <intent>complete</intent> とだけ答えてください。" +
+      "タスクの完了・チェック・終了・済みにする、またはタスクが完了した・終わった・できたと報告するなら <intent>complete</intent> とだけ答えてください。" +
       "今日の日付(JST): " + label + " (" + iso + ")";
     const intentRaw = await callClaude(intentSys, text);
     const intentMatch = intentRaw.match(/<intent>(.*?)<\/intent>/);
@@ -1215,10 +1215,11 @@ async function applyDelete(ev, areaEl) {
 // ===== タスクの完了 =====
 async function handleComplete(text, iso, label) {
   const { weekStart: ws, weekEnd: we } = getJSTDate();
+
+  // キーワード抽出（曖昧な場合は空にして全件表示）
   const searchSys = "今日の日付(JST): " + label + " (" + iso + ") " +
-    "週は月曜始まりです。今週は " + ws + "（月）〜" + we + "（日）です。" +
-    "ユーザーが完了にしたいタスクを特定するため、検索に使うキーワードを判定してください。" +
-    "<keyword>タスク名や関連語</keyword> の形式で答えてください。";
+    "ユーザーが完了にしたい特定のタスク名が含まれていれば <keyword>タスク名</keyword> の形式で答えてください。" +
+    "「今日のタスク」「タスクを完了した」など特定のタスク名が不明な場合は <keyword></keyword> と答えてください。";
   const searchRaw = await callClaude(searchSys, text);
   const kwMatch = searchRaw.match(/<keyword>(.*?)<\/keyword>/);
   const keyword = kwMatch ? kwMatch[1].trim() : "";
@@ -1234,7 +1235,7 @@ async function handleComplete(text, iso, label) {
   const taskData = await taskRes.json();
   const kw = keyword.toLowerCase();
   const tasks = (taskData.items || [])
-    .filter(t => t.title && (!kw || t.title.toLowerCase().includes(kw)))
+    .filter(t => t.title && t.status !== "completed" && (!kw || t.title.toLowerCase().includes(kw)))
     .map(t => ({...t, _type: "task"}));
 
   if (tasks.length === 0) {
