@@ -433,7 +433,8 @@ async function propose() {
       "予定の新規登録なら <intent>add</intent>、" +
       "既存の予定・タスクの変更・修正・更新・メモ追加・時間変更・タイトル変更なら <intent>edit</intent>、" +
       "既存の予定・タスクの削除・取り消し・消去なら <intent>delete</intent>、" +
-      "タスクの完了・チェック・終了・済みにする、またはタスクが完了した・終わった・できたと報告するなら <intent>complete</intent> とだけ答えてください。" +
+      "タスクの完了・チェック・終了・済みにする、またはタスクが完了した・終わった・できたと報告するなら <intent>complete</intent>、" +
+      "タスクをスケジュールに割り振る・配置する・振り分けるなら <intent>schedule</intent> とだけ答えてください。" +
       "今日の日付(JST): " + label + " (" + iso + ")";
     const intentRaw = await callClaude(intentSys, text);
     const intentMatch = intentRaw.match(/<intent>(.*?)<\/intent>/);
@@ -447,12 +448,14 @@ async function propose() {
       await handleDelete(text, iso, label);
     } else if (intent === "complete") {
       await handleComplete(text, iso, label);
+    } else if (intent === "schedule") {
+      await handleSchedule(text, iso, label);
     } else {
       await handleAdd(text, iso, label);
     }
     } // end of intent detection else block
   } catch(e) {
-    await showError(e.message, intent === "view" ? "view" : intent === "edit" ? "edit" : intent === "delete" ? "delete" : intent === "complete" ? "complete" : "propose");
+    await showError(e.message, intent === "view" ? "view" : intent === "edit" ? "edit" : intent === "delete" ? "delete" : intent === "complete" ? "complete" : intent === "schedule" ? "schedule" : "propose");
   } finally {
     setLoading(false);
   }
@@ -1364,6 +1367,268 @@ async function applyComplete(task, taskListId, areaEl) {
   }
 }
 
+// ===== タスクの割り振り =====
+// 割り振りの状態管理
+let scheduleState = null; // { tasks, taskListId, startDate, endDate, calEvents }
+
+async function handleSchedule(text, iso, label) {
+  const { weekStart, weekEnd } = getJSTDate();
+
+  // AIに割り振り期間を判定させる
+  const nextMonStart = (() => { const d = new Date(weekStart); d.setDate(d.getDate()+7); return d.toISOString().slice(0,10); })();
+  const nextSunEnd   = (() => { const d = new Date(weekEnd);   d.setDate(d.getDate()+7); return d.toISOString().slice(0,10); })();
+  const rangeSys = "今日の日付(JST): " + label + " (" + iso + ") " +
+    "今週: " + weekStart + "〜" + weekEnd + " 来週: " + nextMonStart + "〜" + nextSunEnd + " " +
+    "ユーザーが割り振りたい期間を判定し <range>開始ISO,終了ISO</range> で答えてください。" +
+    "「来週中」なら来週月曜〜日曜、「今週中」なら今週月曜〜日曜、「3月30日まで」なら今日〜3月30日。";
+  const rangeRaw = await callClaude(rangeSys, text);
+  const rangeMatch = rangeRaw.match(/<range>(.*?),(.*?)<\/range>/);
+  if (!rangeMatch) {
+    addMsg("割り振り期間を判定できませんでした。「来週中にタスクを割り振って」のように話しかけてください。", "assistant");
+    return;
+  }
+  const startDate = rangeMatch[1].trim();
+  const endDate   = rangeMatch[2].trim();
+
+  await ensureToken();
+
+  // カレンダー予定を取得（忙しさ把握用）
+  const calParams = new URLSearchParams({
+    timeMin: startDate + "T00:00:00+09:00",
+    timeMax: endDate + "T23:59:59+09:00",
+    singleEvents: "true", orderBy: "startTime", maxResults: "50",
+  });
+  const calRes = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events?" + calParams, {
+    headers: { "Authorization": "Bearer " + accessToken },
+  });
+  if (!calRes.ok) throw new Error("カレンダー取得失敗");
+  const calData = await calRes.json();
+  const calEvents = (calData.items || []).filter(e => e.summary);
+
+  // 未完了タスクを全件取得
+  const taskListId = await getDefaultTaskList();
+  const taskRes = await fetch(
+    "https://tasks.googleapis.com/tasks/v1/lists/" + taskListId + "/tasks?maxResults=100&showCompleted=false",
+    { headers: { "Authorization": "Bearer " + accessToken } }
+  );
+  if (!taskRes.ok) throw new Error("タスク取得失敗");
+  const taskData = await taskRes.json();
+  const allTasks = (taskData.items || []).filter(t => t.title && t.status !== "completed");
+
+  if (allTasks.length === 0) {
+    addMsg("未完了のタスクが見つかりませんでした。", "assistant");
+    return;
+  }
+
+  // 状態を保存
+  scheduleState = { tasks: allTasks, taskListId, startDate, endDate, calEvents };
+
+  // タスク選択画面を表示
+  const endLabel = new Date(endDate + "T00:00:00+09:00")
+    .toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+  addMsg("割り振りたいタスクを選んでください（複数選択可）。\n期間: " + startDate + " 〜 " + endLabel, "assistant");
+  renderTaskSelector(allTasks);
+}
+
+function renderTaskSelector(tasks) {
+  document.getElementById("task-selector")?.remove();
+
+  const area = document.createElement("div");
+  area.id = "task-selector";
+  area.style.cssText = "width:100%;max-width:660px;padding:0 16px 8px;display:flex;flex-direction:column;gap:8px;";
+
+  const selected = new Set();
+
+  tasks.forEach((t, idx) => {
+    const dueLabel = t.due
+      ? new Date(t.due).toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"})
+      : "期限なし";
+
+    const card = document.createElement("div");
+    card.id = "task-sel-" + idx;
+    card.style.cssText = "background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:12px;cursor:pointer;";
+
+    const checkbox = document.createElement("div");
+    checkbox.id = "chk-" + idx;
+    checkbox.style.cssText = "width:20px;height:20px;border-radius:5px;border:2px solid rgba(255,255,255,0.3);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:13px;";
+
+    const info = document.createElement("div");
+    info.style.cssText = "flex:1;";
+    info.innerHTML = '<div style="font-weight:600;font-size:14px;">' + t.title + '</div>' +
+      '<div style="color:#718096;font-size:12px;margin-top:2px;">✅ ' + dueLabel + '</div>';
+
+    card.appendChild(checkbox);
+    card.appendChild(info);
+
+    card.onclick = () => {
+      if (selected.has(idx)) {
+        selected.delete(idx);
+        card.style.borderColor = "rgba(255,255,255,0.1)";
+        checkbox.textContent = "";
+        checkbox.style.background = "transparent";
+      } else {
+        selected.add(idx);
+        card.style.borderColor = "rgba(72,187,120,0.6)";
+        checkbox.textContent = "✓";
+        checkbox.style.cssText += "background:rgba(72,187,120,0.3);color:#48bb78;border-color:rgba(72,187,120,0.6);";
+      }
+    };
+
+    area.appendChild(card);
+  });
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;gap:8px;margin-top:4px;";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.textContent = "選択したタスクを割り振る";
+  confirmBtn.style.cssText = "flex:1;background:linear-gradient(135deg,#4299e1,#48bb78);border:none;border-radius:10px;padding:12px;color:#fff;font-weight:700;font-size:14px;cursor:pointer;font-family:inherit;";
+  confirmBtn.onclick = async () => {
+    if (selected.size === 0) { alert("タスクを1つ以上選んでください"); return; }
+    area.remove();
+    const selectedTasks = [...selected].map(i => tasks[i]);
+    setLoading(true);
+    try {
+      const { iso, label } = getJSTDate();
+      await distributeSchedule(selectedTasks, iso, label);
+    } catch(e) {
+      await showError(e.message, "schedule");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "キャンセル";
+  cancelBtn.style.cssText = "background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.09);border-radius:10px;padding:12px 16px;color:#718096;font-size:13px;cursor:pointer;font-family:inherit;";
+  cancelBtn.onclick = () => { scheduleState = null; area.remove(); };
+
+  btnRow.appendChild(confirmBtn);
+  btnRow.appendChild(cancelBtn);
+  area.appendChild(btnRow);
+
+  document.getElementById("messages").after(area);
+  area.scrollIntoView({behavior:"smooth"});
+}
+
+async function distributeSchedule(selectedTasks, iso, label) {
+  const { startDate, endDate, calEvents, taskListId } = scheduleState;
+
+  // カレンダーの忙しさを日別に集計
+  const busyMap = {};
+  calEvents.forEach(e => {
+    const d = (e.start?.dateTime || e.start?.date || "").slice(0,10);
+    if (d) busyMap[d] = (busyMap[d] || 0) + 1;
+  });
+
+  const calText = Object.entries(busyMap).map(([d,n]) => d + ": " + n + "件の予定").join(", ") || "予定なし";
+  const taskText = selectedTasks.map(t =>
+    "・「" + t.title + "」" +
+    (t.due ? "（期限: " + t.due.slice(0,10) + "）" : "（期限なし）") +
+    (t.notes ? " メモ: " + t.notes : "")
+  ).join("\n");
+
+  const scheduleSys = "あなたはスケジュール管理アシスタントです。" +
+    "今日の日付(JST): " + label + " (" + iso + ") " +
+    "以下のタスクを " + startDate + " から " + endDate + " の間に割り振ってください。" +
+    "【ルール】" +
+    "・期限が指定されているタスクはその期限日以前に必ず配置してください。" +
+    "・予定が多い日（忙しい日）はタスクを少なく、空いている日は多めに配置してください。" +
+    "・1日に詰め込みすぎず、バランスよく分散してください。" +
+    '・割り振り結果を <assignments>[{"taskTitle":"タスク名","assignedDate":"YYYY-MM-DD"},...] </assignments> のJSON形式で返してください。' +
+    "その後に日本語で割り振り理由を簡潔に説明してください。";
+
+  const raw = await callClaude(scheduleSys,
+    "タスク一覧:\n" + taskText + "\n\nカレンダーの忙しさ: " + calText
+  );
+
+  const assignMatch = raw.match(/<assignments>([\s\S]*?)<\/assignments>/);
+  if (!assignMatch) {
+    addMsg("割り振り結果を解析できませんでした。", "assistant");
+    return;
+  }
+
+  const assignments = JSON.parse(assignMatch[1]);
+  const explanation = raw.replace(/<assignments>[\s\S]*?<\/assignments>/g, "").trim();
+  addMsg(explanation || "以下の割り振りを提案します。", "assistant");
+
+  renderScheduleConfirm(assignments, selectedTasks, taskListId);
+}
+
+function renderScheduleConfirm(assignments, tasks, taskListId) {
+  document.getElementById("schedule-confirm")?.remove();
+
+  const area = document.createElement("div");
+  area.id = "schedule-confirm";
+  area.style.cssText = "width:100%;max-width:660px;padding:0 16px 8px;display:flex;flex-direction:column;gap:8px;";
+
+  assignments.forEach(a => {
+    const dateLabel = new Date(a.assignedDate + "T00:00:00+09:00")
+      .toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+    const card = document.createElement("div");
+    card.style.cssText = "background:rgba(255,255,255,0.04);border:1px solid rgba(72,187,120,0.3);border-radius:10px;padding:10px 14px;font-size:13px;color:#cbd5e0;";
+    card.textContent = "📅 " + dateLabel + "  ✅ " + a.taskTitle;
+    area.appendChild(card);
+  });
+
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;gap:8px;margin-top:4px;";
+
+  const confirmBtn = document.createElement("button");
+  confirmBtn.textContent = "この割り振りで期限を設定する";
+  confirmBtn.style.cssText = "flex:1;background:linear-gradient(135deg,#4299e1,#48bb78);border:none;border-radius:10px;padding:12px;color:#fff;font-weight:700;font-size:14px;cursor:pointer;font-family:inherit;";
+  confirmBtn.onclick = () => applySchedule(assignments, tasks, taskListId, area);
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "キャンセル";
+  cancelBtn.style.cssText = "background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.09);border-radius:10px;padding:12px 16px;color:#718096;font-size:13px;cursor:pointer;font-family:inherit;";
+  cancelBtn.onclick = () => area.remove();
+
+  btnRow.appendChild(confirmBtn);
+  btnRow.appendChild(cancelBtn);
+  area.appendChild(btnRow);
+
+  document.getElementById("messages").after(area);
+  area.scrollIntoView({behavior:"smooth"});
+}
+
+async function applySchedule(assignments, tasks, taskListId, areaEl) {
+  areaEl.remove();
+  setLoading(true);
+  const bubble = addMsg("タスクの期限を設定中...", "assistant");
+
+  const results = [];
+  const errors = [];
+
+  try {
+    await ensureToken();
+    for (const a of assignments) {
+      const task = tasks.find(t => t.title === a.taskTitle);
+      if (!task) continue;
+      try {
+        const body = { ...task, due: a.assignedDate + "T00:00:00Z" };
+        const res = await fetch("https://tasks.googleapis.com/tasks/v1/lists/" + taskListId + "/tasks/" + task.id, {
+          method: "PUT",
+          headers: { "Authorization": "Bearer " + accessToken, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(res.status);
+        const dateLabel = new Date(a.assignedDate + "T00:00:00+09:00")
+          .toLocaleDateString("ja-JP", {month:"numeric",day:"numeric",weekday:"short"});
+        results.push("✅ 「" + a.taskTitle + "」→ " + dateLabel);
+      } catch(e) {
+        errors.push("⚠️ 「" + a.taskTitle + "」: 設定失敗");
+      }
+    }
+    bubble.textContent = results.join("\n") + (errors.length ? "\n" + errors.join("\n") : "") + "\n\n期限を設定しました！";
+  } catch(e) {
+    bubble.remove();
+    await showError(e.message, "schedule");
+  } finally {
+    setLoading(false);
+  }
+}
+
 // ===== Google Calendar API =====
 async function createCalendarEvent(p) {
   await ensureToken();
@@ -1428,7 +1693,7 @@ async function createTaskWithList(p, listId) {
 
 // ===== エラー表示 + AI分析 =====
 async function showError(errorMsg, context) {
-  const contextLabel = context === "propose" ? "提案リクエスト" : context === "view" ? "スケジュール閲覧" : context === "edit" ? "予定の変更" : context === "delete" ? "予定の削除" : context === "complete" ? "タスクの完了" : "Google登録";
+  const contextLabel = context === "propose" ? "提案リクエスト" : context === "view" ? "スケジュール閲覧" : context === "edit" ? "予定の変更" : context === "delete" ? "予定の削除" : context === "complete" ? "タスクの完了" : context === "schedule" ? "タスクの割り振り" : "Google登録";
   const bubble = addMsg(
     "❌ エラーが発生しました\n\n" +
     "【エラー内容】\n" + errorMsg + "\n\n" +
