@@ -1532,7 +1532,8 @@ async function distributeSchedule(selectedTasks, iso, label) {
     "今日の日付(JST): " + label + " (" + iso + ") " +
     "以下のタスクを " + startDate + " から " + endDate + " の間に割り振ってください。" +
     "【ルール】" +
-    "・期限が指定されているタスクはその期限日以前に必ず配置してください。" +
+    "・タスクの既存の期限は無視してください。" +
+    "・" + startDate + " から " + endDate + " の間だけを使って割り振ってください。" +
     "・予定が多い日（忙しい日）はタスクを少なく、空いている日は多めに配置してください。" +
     "・1日に詰め込みすぎず、バランスよく分散してください。" +
     '・割り振り結果を <assignments>[{"taskTitle":"タスク名","assignedDate":"YYYY-MM-DD"},...] </assignments> のJSON形式で返してください。' +
